@@ -1,6 +1,8 @@
 [package]
 name = "normal2bump"
 description = "Convert tangent-space normal maps to height/bump maps"
+author = ["Noah Zentzis <ngz@generalproblem.net>"]
+license = "MIT"
 version = "0.1.0"
 edition = "2021"
 
