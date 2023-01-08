@@ -1,132 +1,14 @@
-use std::f32::consts::SQRT_2;
 use std::io::Write;
 
-use rayon::prelude::*;
+mod cpu;
+
+mod field;
+use field::*;
 
 const BASE_STEP: f32 = 0.001;
-const WORK_ITEM_SIZE: usize = 8;
 
 const ERR_WINDOW: usize = 3_000;
 const ERR_THRESHOLD: f32 = 1.0e-5;
-
-struct Field<T> {
-    size: (usize, usize),
-    data: Vec<T>,
-}
-
-impl<T: Copy> Field<T> {
-    fn new(size: (usize, usize), val: T) -> Self {
-        Self {
-            size,
-            data: vec![val; size.0*size.1],
-        }
-    }
-
-    fn get(&self, x: usize, y: usize) -> T {
-        self.data[x + y*self.size.0]
-    }
-
-    fn get_mut(&mut self, x: usize, y: usize) -> &mut T {
-        &mut self.data[x + y*self.size.0]
-    }
-}
-
-impl Field<f32> {
-    fn grad_at(&self, x: usize, y: usize) -> [f32; 2] {
-        let cur = self.get(x, y);
-
-        let mut dx = 0.;
-        let mut dy = 0.;
-        let mut n_dx = 0;
-        let mut n_dy = 0;
-
-        let up_y    = if y > 0 { y-1 } else { self.size.1-1 };
-        let down_y  = if (y+1) < self.size.1 { y+1 } else { 0 };
-
-        let left_x  = if x > 0 { x-1 } else { self.size.0-1 };
-        let right_x = if (x+1) < self.size.0 { x+1 } else { 0 };
-
-        { // up
-            let up = self.get(x, up_y);
-            dy += cur - up;
-            n_dy += 1;
-        }
-        { // down
-            let down = self.get(x, down_y);
-            dy += down - cur;
-            n_dy += 1;
-        }
-
-        { // left
-            let left = self.get(left_x, y);
-            dx += cur - left;
-            n_dx += 1;
-        }
-        { // right
-            let right = self.get(right_x, y);
-            dx += right - cur;
-            n_dx += 1;
-        }
-
-        // up-left
-        {
-            let ul = self.get(left_x, up_y);
-            dx += (cur - ul) / SQRT_2;
-            dy += (cur - ul) / SQRT_2;
-            n_dx += 1;
-            n_dy += 1;
-        }
-
-        // up-right
-        {
-            let ur = self.get(right_x, up_y);
-            dx += (ur - cur) / SQRT_2;
-            dy += (cur - ur) / SQRT_2;
-            n_dx += 1;
-            n_dy += 1;
-        }
-
-        // down-left
-        {
-            let dl = self.get(left_x, down_y);
-            dx += (cur - dl) / SQRT_2;
-            dy += (dl - cur) / SQRT_2;
-            n_dx += 1;
-            n_dy += 1;
-        }
-
-        // down-right
-        {
-            let dr = self.get(right_x, down_y);
-            dx += (dr - cur) / SQRT_2;
-            dy += (dr - cur) / SQRT_2;
-            n_dx += 1;
-            n_dy += 1;
-        }
-
-        // compute deltas and return
-        [dx / (n_dx as f32), dy / (n_dy as f32)]
-    }
-}
-
-struct Subfield<T> {
-    field: Field<T>,
-    base: (usize, usize),
-}
-
-impl<T: Copy> Subfield<T> {
-    fn get(&self, x: usize, y: usize) -> T {
-        self.field.get(x - self.base.0, y - self.base.1)
-    }
-
-    fn get_mut(&mut self, x: usize, y: usize) -> &mut T {
-        assert!(x >= self.base.0, "{} < {}", x, self.base.0);
-        assert!(y >= self.base.1, "{} < {}", y, self.base.1);
-        let x = x - self.base.0;
-        let y = y - self.base.1;
-        self.field.get_mut(x, y)
-    }
-}
 
 /// Given a color in the normal map, return the associated gradient vector
 fn gradient_from_normal_color(pixel: image::Rgb<u8>) -> [f32; 2] {
@@ -147,9 +29,10 @@ fn save_heightmap(fname: &str, field: &Field<f32>) -> Result<(), image::ImageErr
         let val = (val * 255.) as u8;
         p.0 = [val; 3];
     }
-    Ok(out_img.save(fname)?)
+    out_img.save(fname)
 }
 
+/// Timing region
 struct Region {
     times: Vec<std::time::Duration>,
     next_ptr: usize,
@@ -253,8 +136,12 @@ impl<const N: usize> MetricHistory<N> {
     }
 }
 
+pub struct OptimizeParams {
+    step: f32,
+}
+
 fn main() {
-    let fname = std::env::args_os().skip(1).next()
+    let fname = std::env::args_os().nth(1)
                .expect("no filename given");
     let image = image::io::Reader::open(fname)
                .expect("unable to open image")
@@ -262,207 +149,70 @@ fn main() {
                .expect("unable to decode image");
     let rgb8 = image.into_rgb8();
 
-    let base = {
-        let fname = std::env::args_os().skip(2).next();
-        let image = match fname {
-            Some(n) => image::io::Reader::open(n)
-                      .expect("unable to open image").decode()
-                      .expect("unable to decode image")
-                      .into_rgb8(),
-            None => image::RgbImage::new(rgb8.width(), rgb8.height()),
-        };
-
-        assert_eq!(image.width(), rgb8.width());
-        assert_eq!(image.height(), rgb8.height());
-        image
-    };
-    let image = rgb8;
-
     // compute gradient field
-    let mut gradient = Field::new((image.width() as usize, image.height() as usize), [0.0f32; 2]);
-    for (x, y, pix) in image.enumerate_pixels() {
+    let mut gradient = Field::new((rgb8.width() as usize, rgb8.height() as usize), [0.0f32; 2]);
+    for (x, y, pix) in rgb8.enumerate_pixels() {
         let x = x as usize;
         let y = y as usize;
         *gradient.get_mut(x, y) = gradient_from_normal_color(*pix);
     }
 
-    // construct initial heightmap
-    let mut out = Field::new((image.width() as usize, image.height() as usize), 0.0f32);
-    for (x, y, pix) in base.enumerate_pixels() {
-        let val = (pix.0[0] as f32) / 255.;
-        *out.get_mut(x as usize, y as usize) = val;
-    }
+    // build optimizer
+    let params = OptimizeParams {
+        step: BASE_STEP,
+    };
+    let mut optimizer = match std::env::args_os().nth(2) {
+        Some(n) => {
+            let image = image::io::Reader::open(n)
+                       .expect("unable to open image").decode()
+                       .expect("unable to decode image")
+                       .into_rgb8();
+            assert_eq!(image.width(), rgb8.width());
+            assert_eq!(image.height(), rgb8.height());
 
-    // iteratively compute heightmap
-    let step = BASE_STEP;
-    let mut iters = 0;
+            // initialize heightmap
+            let mut out = Field::new((image.width() as usize, image.height() as usize), 0.0f32);
+            for (x, y, pix) in image.enumerate_pixels() {
+                let val = (pix.0[0] as f32) / 255.;
+                *out.get_mut(x as usize, y as usize) = val;
+            }
 
-    // allocate thread work items
-    struct ShardData {
-        y: usize,
-        ymax: usize,
-        data: Subfield<f32>,
-        error: f32,
-    }
-    let num_shards = (image.height() as usize / WORK_ITEM_SIZE).max(1);
-    let mut work_items = (0..num_shards).into_iter()
-                        .map(|idx| {
-                            let field_sz = if idx == 0 {WORK_ITEM_SIZE+1} else {WORK_ITEM_SIZE+2};
-                            let field_ybase = if idx == 0 {0} else {idx*WORK_ITEM_SIZE - 1};
-                            ShardData {
-                                y: idx*WORK_ITEM_SIZE,
-                                ymax: ((idx+1)*WORK_ITEM_SIZE).min(image.height() as usize),
-                                data: Subfield {
-                                    field: Field::new((image.width() as usize, field_sz), 0.),
-                                    base: (0, field_ybase),
-                                },
-                                error: 0.,
-                            }
-                        })
-                        .collect::<Vec<_>>();
+            cpu::Optimizer::new_with_map(params, &gradient, out)
+        },
+        None => cpu::Optimizer::new(params, &gradient),
+    };
 
     let mut err_history = MetricHistory::<ERR_WINDOW>::new();
 
     let mut r_update = Region::new();
-    let mut r_join = Region::new();
-    let mut r_renorm = Region::new();
 
     let stdout = std::io::stdout();
     let mut io_lock = stdout.lock();
     loop {
         // update step
         r_update.begin();
-        work_items.par_iter_mut().for_each(|item| {
-            item.data.field.data.fill(0.);
-            item.error = 0.;
-            for y in item.y..item.ymax {
-                for x in 0..out.size.0 {
-                    let target = gradient.get(x, y);
-                    let current = out.grad_at(x, y);
-
-                    let err = [target[0] - current[0], target[1] - current[1]];
-                    item.error += (1.0 - (target[0]*current[0] + target[1]*current[1])).abs();
-                    
-                    // shove energy around
-                    let dot_ul = err[0]/-SQRT_2 + err[1]/-SQRT_2;
-                    let dot_u = -err[1];
-                    let dot_ur = err[0]/SQRT_2 + err[1]/-SQRT_2;
-                    let dot_l = -err[0];
-                    let dot_r = err[0];
-                    let dot_dl = err[0]/-SQRT_2 + err[1]/SQRT_2;
-                    let dot_d = err[1];
-                    let dot_dr = err[0]/SQRT_2 + err[1]/SQRT_2;
-
-                    // energy xfer left
-                    let delta = dot_l * step;
-                    if x > 0 {
-                        *item.data.get_mut(x, y) -= delta;
-                        *item.data.get_mut(x-1, y) += delta;
-                    }
-
-                    // energy xfer right
-                    let delta = dot_r * step;
-                    if (x+1) < out.size.0 {
-                        *item.data.get_mut(x, y) -= delta;
-                        *item.data.get_mut(x+1, y) += delta;
-                    }
-
-                    // energy xfer up
-                    let delta = dot_u * step;
-                    if y > 0 {
-                        *item.data.get_mut(x, y) -= delta;
-                        *item.data.get_mut(x, y-1) += delta;
-                    }
-
-                    // energy xfer down
-                    let delta = dot_d * step;
-                    if (y+1) < out.size.0 {
-                        *item.data.get_mut(x, y) -= delta;
-                        *item.data.get_mut(x, y+1) += delta;
-                    }
-
-                    // energy xfer up-left
-                    let delta = dot_ul * step;
-                    if x > 0 && y > 0 {
-                        *item.data.get_mut(x, y) -= delta;
-                        *item.data.get_mut(x-1, y-1) += delta;
-                    }
-
-                    // energy xfer up-right
-                    let delta = dot_ur * step;
-                    if (x+1) < out.size.0 && y > 0 {
-                        *item.data.get_mut(x, y) -= delta;
-                        *item.data.get_mut(x+1, y-1) += delta;
-                    }
-
-                    // energy xfer down-left
-                    let delta = dot_dl * step;
-                    if x > 0 && (y+1) < out.size.0 {
-                        *item.data.get_mut(x, y) -= delta;
-                        *item.data.get_mut(x-1, y+1) += delta;
-                    }
-
-                    // energy xfer down-right
-                    let delta = dot_dr * step;
-                    if (x+1) < out.size.0 && (y+1) < out.size.0 {
-                        *item.data.get_mut(x, y) -= delta;
-                        *item.data.get_mut(x+1, y+1) += delta;
-                    }
-                }
-            }
-        });
+        let accum_err = optimizer.step();
         r_update.end();
-
-        // update based on sharded delta values
-        r_join.begin();
-        let mut accum_err = 0.;
-        for shard in work_items.iter() {
-            // shards have border regions of 1 row below/above - make sure to account for those
-            let ymin = shard.y.saturating_sub(1);
-            let ymax = (shard.ymax + 1).min(out.size.1);
-            for y in ymin..ymax {
-                for x in 0..out.size.0 {
-                    *out.get_mut(x, y) += shard.data.get(x, y);
-                }
-            }
-            accum_err += shard.error;
-        }
-        r_join.end();
-
-        // re-normalize
-        r_renorm.begin();
-        let (min, max) = out.data.par_iter()
-                        .map(|x| (*x, *x))
-                        .reduce(|| (f32::INFINITY, f32::NEG_INFINITY),
-                                |(min_a, max_a), (min_b, max_b)| {
-                                    (min_a.min(min_b), max_a.max(max_b))
-                                });
-        out.data.par_iter_mut().for_each(|data| {
-            *data = (*data - min) / (max - min);
-        });
-        r_renorm.end();
-
         err_history.push(accum_err);
+
+        let iters = optimizer.iters();
         if iters % 50 == 0 {
             let (min, max) = err_history.bounds();
             let err_delta = max - min;
             write!(io_lock,
-                "\r{iters:10} {err_delta:10} | update: {r_update}  join: {r_join}  renorm: {r_renorm}"
+                "\r{iters:10} {err_delta:10} | update: {r_update}    "
             ).unwrap();
             io_lock.flush().unwrap();
 
-            if err_history.is_full() {
-                if err_delta < ERR_THRESHOLD {
-                    break;
-                }
+            if err_history.is_full() && err_delta < ERR_THRESHOLD {
+                break;
             }
         }
 
         if accum_err < 0.5 {
             break;
         }
-        iters += 1;
     }
 
-    save_heightmap("final.png", &out).unwrap();
+    save_heightmap("final.png", &optimizer.finish()).unwrap();
 }
