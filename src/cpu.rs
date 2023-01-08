@@ -1,5 +1,6 @@
 //! CPU-based implementation of field optimizer
 use rayon::prelude::*;
+use anyhow::Result;
 
 use std::f32::consts::SQRT_2;
 
@@ -41,7 +42,7 @@ impl<'i> Optimizer<'i> {
         params: OptimizeParams,
         gradients: &'i VectorField<2>,
         map: Field<f32>
-    ) -> Self {
+    ) -> Result<Self> {
         assert_eq!(gradients.size, map.size);
 
         let (width, height) = gradients.size;
@@ -62,14 +63,14 @@ impl<'i> Optimizer<'i> {
                         })
                         .collect::<Vec<_>>();
 
-        Self {
+        Ok(Self {
             params, gradients, heightmap: map, work_items,
             iters: 0,
-        }
+        })
     }
 
     /// Construct an optimizer with an empty heightmap
-    pub fn new(params: crate::OptimizeParams, gradients: &'i VectorField<2>) -> Self {
+    pub fn new(params: crate::OptimizeParams, gradients: &'i VectorField<2>) -> Result<Self> {
         let heightmap = Field::new(gradients.size, 0.0);
         Self::new_with_map(params, gradients, heightmap)
     }

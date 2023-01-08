@@ -1,14 +1,15 @@
 use std::io::Write;
 
 mod cpu;
+mod gpu;
 
 mod field;
 use field::*;
 
 const BASE_STEP: f32 = 0.001;
 
-const ERR_WINDOW: usize = 3_000;
-const ERR_THRESHOLD: f32 = 1.0e-5;
+const ERR_WINDOW: usize = 1_000;
+const ERR_THRESHOLD: f32 = 1.0e-10;
 
 /// Given a color in the normal map, return the associated gradient vector
 fn gradient_from_normal_color(pixel: image::Rgb<u8>) -> [f32; 2] {
@@ -161,7 +162,7 @@ fn main() {
     let params = OptimizeParams {
         step: BASE_STEP,
     };
-    let mut optimizer = match std::env::args_os().nth(2) {
+    let optimizer = match std::env::args_os().nth(2) {
         Some(n) => {
             let image = image::io::Reader::open(n)
                        .expect("unable to open image").decode()
@@ -177,9 +178,16 @@ fn main() {
                 *out.get_mut(x as usize, y as usize) = val;
             }
 
-            cpu::Optimizer::new_with_map(params, &gradient, out)
+            gpu::Optimizer::new_with_map(params, &gradient, out)
         },
-        None => cpu::Optimizer::new(params, &gradient),
+        None => gpu::Optimizer::new(params, &gradient),
+    };
+    let mut optimizer = match optimizer {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("error: failed to create optimizer backend: {}", e);
+            return;
+        }
     };
 
     let mut err_history = MetricHistory::<ERR_WINDOW>::new();
@@ -196,7 +204,7 @@ fn main() {
         err_history.push(accum_err);
 
         let iters = optimizer.iters();
-        if iters % 50 == 0 {
+        if iters % 100 == 0 {
             let (min, max) = err_history.bounds();
             let err_delta = max - min;
             write!(io_lock,
