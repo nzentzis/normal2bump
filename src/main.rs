@@ -1,4 +1,8 @@
+use clap::Parser;
+use anyhow::Context;
+
 use std::io::Write;
+use std::path::PathBuf;
 
 mod cpu;
 mod gpu;
@@ -6,10 +10,93 @@ mod gpu;
 mod field;
 use field::*;
 
-const BASE_STEP: f32 = 0.001;
-
 const ERR_WINDOW: usize = 1_000;
 const ERR_THRESHOLD: f32 = 1.0e-10;
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum ComputeBackend { Cpu, Gpu, Auto }
+
+impl ComputeBackend {
+    /// Use the given parameters to construct an Optimizer matching this specification
+    fn build<'g>(
+        &self,
+        params: OptimizeParams,
+        grad: &'g VectorField<2>,
+        seed: Option<Field<f32>>
+    ) -> anyhow::Result<Box<dyn Optimizer + 'g>> {
+        match self {
+            Self::Cpu => {
+                let opt = match seed {
+                    Some(s) => cpu::Optimizer::new_with_map(params, grad, s),
+                    None    => cpu::Optimizer::new(params, grad),
+                };
+                Ok(Box::new(opt))
+            },
+            Self::Gpu => {
+                let opt = match seed {
+                    Some(s) => gpu::Optimizer::new_with_map(params, grad, s)?,
+                    None    => gpu::Optimizer::new(params, grad)?,
+                };
+                Ok(Box::new(opt))
+            },
+            Self::Auto => {
+                let par = params.clone();
+                let opt = match seed.as_ref() {
+                    Some(s) => gpu::Optimizer::new_with_map(par, grad, s.clone()),
+                    None    => gpu::Optimizer::new(par, grad),
+                };
+                Ok(opt.map(|x: gpu::Optimizer| -> Box<dyn Optimizer + 'g> { Box::new(x) })
+                      .unwrap_or_else(move |_| Box::new(match seed {
+                          Some(s) => cpu::Optimizer::new_with_map(params, grad, s),
+                          None    => cpu::Optimizer::new(params, grad),
+                      })))
+            },
+        }
+    }
+}
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    #[arg(short, long, value_enum, default_value_t=ComputeBackend::Auto)]
+    backend: ComputeBackend,
+
+    /// Size of each error-diffusion step
+    #[arg(short, long, default_value_t=0.001)]
+    step: f32,
+
+    /// Error derivative at which to stop iterating
+    #[arg(short, long, default_value_t=ERR_THRESHOLD)]
+    threshold: f32,
+
+    /// Disable progress display
+    #[arg(short, long)]
+    quiet: bool,
+
+    /// Normal map to convert
+    input: PathBuf,
+
+    /// Path to output file, or `{input_name}_bump.png` if unspecified
+    output: Option<PathBuf>,
+
+    /// Seed image to start from, instead of starting from an empty heightmap
+    seed: Option<PathBuf>,
+}
+
+trait Optimizer {
+    /// Step the optimizer forwards by one iteration
+    ///
+    /// Returns the accumulated error metric over this iteration.
+    fn step(&mut self) -> f32;
+
+    /// Get the number of completed steps
+    fn iters(&self) -> usize;
+
+    /// Return the final heightmap
+    ///
+    /// This may invalidate the optimizer. Stepping after calling this function should panic.
+    fn finish(&mut self) -> Field<f32>;
+}
 
 /// Given a color in the normal map, return the associated gradient vector
 fn gradient_from_normal_color(pixel: image::Rgb<u8>) -> [f32; 2] {
@@ -22,7 +109,7 @@ fn gradient_from_normal_color(pixel: image::Rgb<u8>) -> [f32; 2] {
 }
 
 /// Save a heightmap
-fn save_heightmap(fname: &str, field: &Field<f32>) -> Result<(), image::ImageError> {
+fn save_heightmap(fname: &std::path::Path, field: &Field<f32>) -> Result<(), image::ImageError> {
     // convert and write
     let mut out_img = image::RgbImage::new(field.size.0 as u32, field.size.1 as u32);
     for (x, y, p) in out_img.enumerate_pixels_mut() {
@@ -137,58 +224,50 @@ impl<const N: usize> MetricHistory<N> {
     }
 }
 
+#[derive(Clone)]
 pub struct OptimizeParams {
     step: f32,
 }
 
-fn main() {
-    let fname = std::env::args_os().nth(1)
-               .expect("no filename given");
-    let image = image::io::Reader::open(fname)
-               .expect("unable to open image")
-               .decode()
-               .expect("unable to decode image");
-    let rgb8 = image.into_rgb8();
+fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
+
+    // TODO: don't truncate higher-precision normal maps
+    let normal = image::io::Reader::open(&args.input)
+                .context("Failed to open input file")?
+                .decode().context("Unable to decode input normal map")?
+                .into_rgb8();
 
     // compute gradient field
-    let mut gradient = Field::new((rgb8.width() as usize, rgb8.height() as usize), [0.0f32; 2]);
-    for (x, y, pix) in rgb8.enumerate_pixels() {
+    let mut gradient = Field::new((normal.width() as usize, normal.height() as usize), [0.0f32; 2]);
+    for (x, y, pix) in normal.enumerate_pixels() {
         let x = x as usize;
         let y = y as usize;
         *gradient.get_mut(x, y) = gradient_from_normal_color(*pix);
     }
 
     // build optimizer
-    let params = OptimizeParams {
-        step: BASE_STEP,
-    };
-    let optimizer = match std::env::args_os().nth(2) {
-        Some(n) => {
-            let image = image::io::Reader::open(n)
-                       .expect("unable to open image").decode()
-                       .expect("unable to decode image")
-                       .into_rgb8();
-            assert_eq!(image.width(), rgb8.width());
-            assert_eq!(image.height(), rgb8.height());
-
-            // initialize heightmap
-            let mut out = Field::new((image.width() as usize, image.height() as usize), 0.0f32);
-            for (x, y, pix) in image.enumerate_pixels() {
-                let val = (pix.0[0] as f32) / 255.;
-                *out.get_mut(x as usize, y as usize) = val;
-            }
-
-            gpu::Optimizer::new_with_map(params, &gradient, out)
+    let seed = args.seed.map(|s| image::io::Reader::open(s)
+                                .context("Failed to open seed image")
+                                .and_then(|img| img.decode()
+                                                   .context("Failed to decode seed image"))
+                                .map(|img| img.into_rgb8()))
+              .transpose()?
+              .map(|seed| {
+                  let mut out = Field::new((seed.width() as usize, seed.height() as usize), 0.);
+                  for (x, y, pix) in seed.enumerate_pixels() {
+                      let val = (pix.0[0] as f32) / 255.;
+                      *out.get_mut(x as usize, y as usize) = val;
+                  }
+                  out
+              });
+    let mut optimizer = args.backend.build(
+        OptimizeParams {
+            step: args.step,
         },
-        None => gpu::Optimizer::new(params, &gradient),
-    };
-    let mut optimizer = match optimizer {
-        Ok(x) => x,
-        Err(e) => {
-            eprintln!("error: failed to create optimizer backend: {}", e);
-            return;
-        }
-    };
+        &gradient,
+        seed
+    ).context("Failed to create optimizer backend")?;
 
     let mut err_history = MetricHistory::<ERR_WINDOW>::new();
 
@@ -207,12 +286,15 @@ fn main() {
         if iters % 100 == 0 {
             let (min, max) = err_history.bounds();
             let err_delta = max - min;
-            write!(io_lock,
-                "\r{iters:10} {err_delta:10} | update: {r_update}    "
-            ).unwrap();
-            io_lock.flush().unwrap();
 
-            if err_history.is_full() && err_delta < ERR_THRESHOLD {
+            if !args.quiet {
+                write!(io_lock,
+                    "\r{iters:10} {err_delta:10} | update: {r_update}    "
+                ).unwrap();
+                io_lock.flush().unwrap();
+            }
+
+            if err_history.is_full() && err_delta < args.threshold {
                 break;
             }
         }
@@ -222,5 +304,18 @@ fn main() {
         }
     }
 
-    save_heightmap("final.png", &optimizer.finish()).unwrap();
+    let out_path = args.output
+                  .unwrap_or_else(|| {
+                      let mut res = args.input.clone();
+                      let mut name = args.input.file_stem()
+                                    .unwrap_or_else(|| "input".as_ref())
+                                    .to_owned();
+                      name.push("_bump.png");
+
+                      res.set_file_name(name);
+                      res
+                  });
+    save_heightmap(&out_path, &optimizer.finish())
+        .context("Failed to save heightmap image")?;
+    Ok(())
 }

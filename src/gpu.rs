@@ -2,7 +2,7 @@
 use anyhow::{Result, Context};
 use pollster::FutureExt;
 
-use crate::field::{Field, Subfield, VectorField};
+use crate::field::{Field, VectorField};
 use crate::OptimizeParams;
 
 const WG_SIZE: usize = 8;
@@ -48,29 +48,26 @@ struct Summary {
 }
 
 pub struct Optimizer<'i> {
-    /// Optimization parameters
-    params: crate::OptimizeParams,
-
     /// Current output map
     heightmap: Field<f32>,
 
     /// Input gradients
-    gradients: &'i VectorField<2>,
+    _gradients: &'i VectorField<2>,
 
     /// Compute context
     context: ComputeContext,
 
     /// Uniform data buffer
-    buf_params: wgpu::Buffer,
+    _buf_params: wgpu::Buffer,
 
     /// Input gradients
-    buf_gradients: wgpu::Buffer,
+    _buf_gradients: wgpu::Buffer,
 
     /// Current output map buffer
     buf_heightmap: wgpu::Buffer,
 
     /// Error gradient buffer
-    buf_errors: wgpu::Buffer,
+    _buf_errors: wgpu::Buffer,
 
     /// Summary data buffer
     buf_summary: wgpu::Buffer,
@@ -310,9 +307,12 @@ impl<'i> Optimizer<'i> {
         };
 
         Ok(Self {
-            params, gradients, heightmap: map,
-            context,
-            buf_params, buf_gradients, buf_heightmap, buf_errors, buf_summary, buf_summary_map,
+            heightmap: map, context,
+            _gradients: gradients,
+            _buf_params: buf_params,
+            _buf_gradients: buf_gradients,
+            _buf_errors: buf_errors,
+            buf_heightmap, buf_summary, buf_summary_map,
             bind_group,
             pl_error, pl_diffuse, pl_summarize_y, pl_summarize, pl_normalize,
             grid_dim,
@@ -325,11 +325,13 @@ impl<'i> Optimizer<'i> {
         let heightmap = Field::new(gradients.size, 0.0);
         Self::new_with_map(params, gradients, heightmap)
     }
+}
 
+impl crate::Optimizer for Optimizer<'_> {
     /// Step the optimizer forwards by one iteration
     ///
     /// Returns the accumulated error metric over this iteration.
-    pub fn step(&mut self) -> f32 {
+    fn step(&mut self) -> f32 {
         let mut encoder = self.context.device.create_command_encoder(
             &wgpu::CommandEncoderDescriptor { label: None });
         {
@@ -416,11 +418,11 @@ impl<'i> Optimizer<'i> {
         }
     }
 
-    pub fn iters(&self) -> usize {
+    fn iters(&self) -> usize {
         self.iters
     }
 
-    pub fn finish(self) -> Field<f32> {
+    fn finish(&mut self) -> Field<f32> {
         let out_buf = self.context.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
@@ -458,7 +460,7 @@ impl<'i> Optimizer<'i> {
         let data_structured: &[f32] = bytemuck::cast_slice(&data);
 
         assert_eq!(data_structured.len(), self.heightmap.data.len());
-        let mut hmap = self.heightmap;
+        let mut hmap = std::mem::replace(&mut self.heightmap, Field::new((0, 0), 0.));
         hmap.data.copy_from_slice(data_structured);
 
         hmap

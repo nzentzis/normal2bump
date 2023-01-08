@@ -1,5 +1,6 @@
 use std::f32::consts::SQRT_2;
 
+#[derive(Clone)]
 pub struct Field<T> {
     pub size: (usize, usize),
     pub data: Vec<T>,

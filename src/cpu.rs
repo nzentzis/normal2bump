@@ -1,6 +1,5 @@
 //! CPU-based implementation of field optimizer
 use rayon::prelude::*;
-use anyhow::Result;
 
 use std::f32::consts::SQRT_2;
 
@@ -42,7 +41,7 @@ impl<'i> Optimizer<'i> {
         params: OptimizeParams,
         gradients: &'i VectorField<2>,
         map: Field<f32>
-    ) -> Result<Self> {
+    ) -> Self {
         assert_eq!(gradients.size, map.size);
 
         let (width, height) = gradients.size;
@@ -63,22 +62,24 @@ impl<'i> Optimizer<'i> {
                         })
                         .collect::<Vec<_>>();
 
-        Ok(Self {
+        Self {
             params, gradients, heightmap: map, work_items,
             iters: 0,
-        })
+        }
     }
 
     /// Construct an optimizer with an empty heightmap
-    pub fn new(params: crate::OptimizeParams, gradients: &'i VectorField<2>) -> Result<Self> {
+    pub fn new(params: crate::OptimizeParams, gradients: &'i VectorField<2>) -> Self {
         let heightmap = Field::new(gradients.size, 0.0);
         Self::new_with_map(params, gradients, heightmap)
     }
+}
 
+impl crate::Optimizer for Optimizer<'_> {
     /// Step the optimizer forwards by one iteration
     ///
     /// Returns the accumulated error metric over this iteration.
-    pub fn step(&mut self) -> f32 {
+    fn step(&mut self) -> f32 {
         let step = self.params.step;
 
         self.work_items.par_iter_mut().for_each(|item| {
@@ -191,11 +192,11 @@ impl<'i> Optimizer<'i> {
         accum_err
     }
 
-    pub fn iters(&self) -> usize {
+    fn iters(&self) -> usize {
         self.iters
     }
 
-    pub fn finish(self) -> Field<f32> {
-        self.heightmap
+    fn finish(&mut self) -> Field<f32> {
+        std::mem::replace(&mut self.heightmap, Field::new((0, 0), 0.))
     }
 }
